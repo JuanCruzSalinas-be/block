@@ -1,0 +1,10 @@
+# ByteTrack tuned for this project: fewer spurious new IDs, longer occlusion memory.
+# Based on ultralytics/cfg/trackers/bytetrack.yaml
+
+tracker_type: bytetrack
+track_high_thresh: 0.25 # First-stage match threshold
+track_low_thresh: 0.1 # Second-stage match for low-confidence boxes (keeps IDs through weak detections)
+new_track_thresh: 0.4 # Default 0.25; only confident detections may start a new ID
+track_buffer: 60 # Default 30; keep lost tracks alive longer so cars keep their ID through occlusions
+match_thresh: 0.8
+fuse_score: True

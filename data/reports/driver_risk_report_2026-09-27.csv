@@ -1,0 +1,2 @@
+plate_id,risk_score,risk_tier,incidents,wrong_way,tailgating,weaving,speeding,sharp_turn,hard_braking,stopped_in_lane,cameras,first_seen,last_seen,worst_incident,evidence_snapshot
+OIO3314,3,LOW,1,0,0,0,1,0,0,0,CAM01,2026-09-27,2026-09-27,SPEEDING,data/snapshots/CAM01/output/OIO3314_speeding.jpg
