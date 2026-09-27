@@ -1,4 +1,5 @@
 import argparse
+import shutil
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -7,6 +8,7 @@ import cv2
 import torch
 from ultralytics import YOLO
 
+import ingest
 from hazards import HazardDetector
 from motion import MotionTracker
 from registry import FlagRegistry
@@ -31,6 +33,18 @@ def parse_args():
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--camera", default="CAM01", help="Camera ID stored with each flag.")
     parser.add_argument("--location", default="unknown", help="Where the camera is, e.g. 'Main St & 5th'.")
+    parser.add_argument("--db", default="data/incidents.db", help="Incident database to update.")
+    parser.add_argument("--snapshots", default="data/snapshots", help="Where the database keeps snapshots.")
+    parser.add_argument(
+        "--reset-db",
+        action="store_true",
+        help="Delete the database and its snapshots before running, so it only holds this run.",
+    )
+    parser.add_argument(
+        "--no-db",
+        action="store_true",
+        help="Only write results/flagged_vehicles.csv; don't update the database.",
+    )
     parser.add_argument(
         "--save",
         action="store_true",
@@ -137,7 +151,23 @@ def print_flag_summary(hazards, registry):
         print(f"  {reason:<12} {len(ids):3d}  {plates}")
 
 
-def run_on_source(model, source, device, args, registry):
+def save_to_db(conn, registry, args):
+    """Replace this video's incidents in the database with the latest run."""
+    source = {
+        "camera_id": registry.camera_id,
+        "location": registry.location,
+        "video": registry.video,
+        "video_date": registry.video_date,
+    }
+    rows = [r for r in registry.rows if r["video"] == registry.video]
+    with conn:
+        ingest.ingest_video(conn, source, rows, Path(args.snapshots))
+        ingest.refresh_vehicles(conn)
+    videos, vehicles, incidents = ingest.summary(conn)
+    print(f"Database {args.db}: {videos} videos, {vehicles} vehicles, {incidents} incidents")
+
+
+def run_on_source(model, source, device, args, registry, conn):
     """Run tracking on one video. Returns False if the user pressed q."""
     cap = cv2.VideoCapture(source)
 
@@ -255,6 +285,8 @@ def run_on_source(model, source, device, args, registry):
 
     print_flag_summary(hazards, registry)
     print(f"Flag dataset:          {registry.csv_path}")
+    if conn is not None:
+        save_to_db(conn, registry, args)
 
     return keep_going
 
@@ -273,11 +305,22 @@ def main():
     model = YOLO(args.model)
     registry = FlagRegistry()
 
-    for source in sources:
-        if not run_on_source(model, source, device, args, registry):
-            break
+    conn = None
+    if not args.no_db:
+        if args.reset_db:
+            Path(args.db).unlink(missing_ok=True)
+            shutil.rmtree(args.snapshots, ignore_errors=True)
+            print(f"Cleared {args.db} and {args.snapshots}")
+        conn = ingest.connect(args.db)
 
-    cv2.destroyAllWindows()
+    try:
+        for source in sources:
+            if not run_on_source(model, source, device, args, registry, conn):
+                break
+    finally:
+        if conn is not None:
+            conn.close()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

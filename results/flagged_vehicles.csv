@@ -1,2 +1,0 @@
-plate_id,track_id,reason,camera_id,location,video,video_date,frame,time_s,value,speed,speed_ratio,turn_rate,box,snapshot,recorded_at
-OIO3314,625,SPEEDING,CAM01,unknown,output,2026-09-27,543,36.2,2.627,7.124,2.627,-0.33,908 547 982 600,results/snapshots/output/OIO3314_speeding.jpg,2026-09-27T03:38:16

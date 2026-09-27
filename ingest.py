@@ -1,5 +1,8 @@
 """Load flagged_vehicles.csv into the incident database.
 
+test.py already does this after every video, so this script is only needed to
+re-load a CSV by hand.
+
 Usage:
     python3 ingest.py                      # loads results/flagged_vehicles.csv
     python3 ingest.py path/to/flags.csv --db data/incidents.db
@@ -84,57 +87,76 @@ def copy_snapshot(row, source_id, snapshot_dir):
     return str(dest)
 
 
-def ingest(conn, rows, snapshot_dir):
-    now = datetime.now().isoformat(timespec="seconds")
+def ingest_video(conn, source, rows, snapshot_dir):
+    """Replace one video's incidents with `rows`, which may be empty.
 
+    `source` holds camera_id, location, video and video_date. An empty `rows`
+    still clears the video, so a re-run that flags nothing removes stale incidents.
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    source_id = f"{source['camera_id']}/{source['video']}"
+
+    conn.execute("DELETE FROM incidents WHERE source_id = ?", (source_id,))
+    shutil.rmtree(snapshot_dir / source_id, ignore_errors=True)
+    (snapshot_dir / source_id).mkdir(parents=True)
+
+    conn.execute(
+        """INSERT INTO sources (source_id, camera_id, location, video, video_date, ingested_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(source_id) DO UPDATE SET
+               location = excluded.location,
+               video_date = excluded.video_date,
+               ingested_at = excluded.ingested_at""",
+        (source_id, source["camera_id"], source["location"], source["video"],
+         source["video_date"], now),
+    )
+
+    for row in rows:
+        conn.execute(
+            "INSERT OR IGNORE INTO vehicles (plate_id) VALUES (?)", (row["plate_id"],)
+        )
+        conn.execute(
+            """INSERT INTO incidents (plate_id, source_id, reason, value, speed,
+                   speed_ratio, turn_rate, frame, time_s, box, snapshot)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (row["plate_id"], source_id, row["reason"], number(row["value"]),
+             number(row["speed"]), number(row["speed_ratio"]), number(row["turn_rate"]),
+             number(row["frame"], int), number(row["time_s"]), row["box"],
+             copy_snapshot(row, source_id, snapshot_dir)),
+        )
+    print(f"  {source_id}: {len(rows)} incidents")
+
+
+def refresh_vehicles(conn):
+    """Keep the vehicles table in step with the incidents that remain."""
+    conn.execute("DELETE FROM vehicles WHERE plate_id NOT IN (SELECT plate_id FROM incidents)")
+    conn.execute(
+        """UPDATE vehicles SET
+               first_seen = (SELECT MIN(s.video_date) FROM incidents i
+                             JOIN sources s USING (source_id) WHERE i.plate_id = vehicles.plate_id),
+               last_seen  = (SELECT MAX(s.video_date) FROM incidents i
+                             JOIN sources s USING (source_id) WHERE i.plate_id = vehicles.plate_id)"""
+    )
+
+
+def ingest(conn, rows, snapshot_dir):
     by_source = {}
     for row in rows:
         by_source.setdefault(f"{row['camera_id']}/{row['video']}", []).append(row)
 
     with conn:  # one transaction: all or nothing
-        for source_id, source_rows in by_source.items():
-            first = source_rows[0]
-            conn.execute("DELETE FROM incidents WHERE source_id = ?", (source_id,))
-            shutil.rmtree(snapshot_dir / source_id, ignore_errors=True)
-            (snapshot_dir / source_id).mkdir(parents=True)
-
-            conn.execute(
-                """INSERT INTO sources (source_id, camera_id, location, video, video_date, ingested_at)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(source_id) DO UPDATE SET
-                       location = excluded.location,
-                       video_date = excluded.video_date,
-                       ingested_at = excluded.ingested_at""",
-                (source_id, first["camera_id"], first["location"], first["video"],
-                 first["video_date"], now),
-            )
-
-            for row in source_rows:
-                conn.execute(
-                    "INSERT OR IGNORE INTO vehicles (plate_id) VALUES (?)", (row["plate_id"],)
-                )
-                conn.execute(
-                    """INSERT INTO incidents (plate_id, source_id, reason, value, speed,
-                           speed_ratio, turn_rate, frame, time_s, box, snapshot)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (row["plate_id"], source_id, row["reason"], number(row["value"]),
-                     number(row["speed"]), number(row["speed_ratio"]), number(row["turn_rate"]),
-                     number(row["frame"], int), number(row["time_s"]), row["box"],
-                     copy_snapshot(row, source_id, snapshot_dir)),
-                )
-            print(f"  {source_id}: {len(source_rows)} incidents")
-
-        # Keep the vehicles table in step with the incidents that remain
-        conn.execute("DELETE FROM vehicles WHERE plate_id NOT IN (SELECT plate_id FROM incidents)")
-        conn.execute(
-            """UPDATE vehicles SET
-                   first_seen = (SELECT MIN(s.video_date) FROM incidents i
-                                 JOIN sources s USING (source_id) WHERE i.plate_id = vehicles.plate_id),
-                   last_seen  = (SELECT MAX(s.video_date) FROM incidents i
-                                 JOIN sources s USING (source_id) WHERE i.plate_id = vehicles.plate_id)"""
-        )
+        for source_rows in by_source.values():
+            ingest_video(conn, source_rows[0], source_rows, snapshot_dir)
+        refresh_vehicles(conn)
 
     return len(by_source)
+
+
+def summary(conn):
+    return conn.execute(
+        "SELECT (SELECT COUNT(*) FROM sources), (SELECT COUNT(*) FROM vehicles), "
+        "(SELECT COUNT(*) FROM incidents)"
+    ).fetchone()
 
 
 def main():
@@ -157,10 +179,7 @@ def main():
     print(f"Loading {len(rows)} rows from {csv_path}")
     sources = ingest(conn, rows, Path(args.snapshots))
 
-    totals = conn.execute(
-        "SELECT (SELECT COUNT(*) FROM sources), (SELECT COUNT(*) FROM vehicles), "
-        "(SELECT COUNT(*) FROM incidents)"
-    ).fetchone()
+    totals = summary(conn)
     conn.close()
 
     print(f"Updated {sources} video(s). Database {args.db} now holds "
