@@ -128,16 +128,6 @@ def draw_detections(frame, boxes, track_ids, confidences, metrics, hazards, regi
             2,
         )
 
-    cv2.putText(
-        frame,
-        f"Tracked Vehicles: {len(track_ids)}",
-        (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (0, 255, 0),
-        2,
-    )
-
 
 def print_flag_summary(hazards, registry):
     by_reason = {}
@@ -250,18 +240,6 @@ def run_on_source(model, source, device, args, registry, conn):
         total_detections += vehicle_count
         max_in_frame = max(max_in_frame, vehicle_count)
         unique_ids.update(track_ids)
-
-        elapsed = time.time() - start
-        fps = frames / elapsed if elapsed > 0 else 0
-        cv2.putText(
-            frame,
-            f"FPS: {fps:.1f}",
-            (20, 80),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 255, 0),
-            2,
-        )
 
         if writer is not None:
             writer.write(frame)
