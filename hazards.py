@@ -19,9 +19,13 @@ CONFIG = {
     # velocity step; the apparent motion comes from the detection, not the car
     "max_box_change": 0.2,
 
-    # Hard braking: deceleration in box heights / s^2, from at least this speed
+    # Hard braking: average deceleration in box heights / s^2 over brake_window_s,
+    # from at least brake_min_speed. The window is long enough that box jitter
+    # averages out; a single velocity step is too noisy to tell braking apart.
     "brake_decel_threshold": 4.0,
-    "brake_confirm_frames": 3,    # braking is brief, so it needs fewer frames
+    "brake_window_s": 0.7,
+    "brake_min_drop": 0.4,        # must lose at least this fraction of its speed
+    "brake_confirm_s": 0.2,       # braking is brief, so it needs less time
     "brake_min_speed": 1.5,
 
     # Wrong way: heading differs from the usual traffic direction in that area
@@ -44,9 +48,14 @@ CONFIG = {
     "tailgate_max_heading_diff": 20.0,
     "tailgate_max_lateral": 0.6,  # max side offset, in box heights (same lane)
 
-    # Stopped in lane: was moving, then stopped while traffic keeps flowing
+    # Stopped in lane: was moving, then stopped while traffic going its way keeps
+    # flowing. Cars queued behind another stopped car (red light, jam) don't count.
     "stopped_speed": 0.15,
-    "stopped_seconds": 3.0,
+    "stopped_seconds": 5.0,
+    "stopped_was_moving_s": 1.0,  # must have driven this long first; one jitter spike isn't driving
+    "stopped_min_passing": 2,     # moving cars heading the same way that must still be flowing
+    "stopped_flow_angle": 30.0,   # degrees; how close their heading must be to count
+    "stopped_queue_gap": 2.0,     # car lengths; a stopped car this close ahead means a queue
 }
 
 SPEEDING = "SPEEDING"
@@ -111,9 +120,12 @@ class HazardDetector:
         self.flow = FlowMap(self.cfg["flow_cell_px"], self.cfg["flow_decay"])
         self.turn_history = {}           # track_id -> deque of turn rates
         self.was_moving = set()          # tracks that have driven normally at some point
+        self.last_heading = {}           # track_id -> heading while it was last moving
+        self.speed_history = {}          # track_id -> deque of recent speeds
+        self.brake_frames = max(int(self.cfg["brake_window_s"] * fps), 1)
         self.confirm = {
             STOPPED: int(self.cfg["stopped_seconds"] * fps),
-            HARD_BRAKING: self.cfg["brake_confirm_frames"],
+            HARD_BRAKING: max(int(self.cfg["brake_confirm_s"] * fps), 1),
             WRONG_WAY: int(self.cfg["wrong_way_seconds"] * fps),
         }
 
@@ -135,14 +147,20 @@ class HazardDetector:
             flow_dev = self._flow_deviation(m)
             swings = self._swings(track_id, m)
             headway = headways.get(track_id)
+            decel = self._decel(frame_idx, track_id, m)
 
-            if m.speed >= cfg["brake_min_speed"]:
+            driving = (track_id, "_driving")
+            self.streaks[driving] = self.streaks[driving] + 1 if m.speed >= cfg["brake_min_speed"] else 0
+            if self.streaks[driving] >= cfg["stopped_was_moving_s"] * self.fps:
                 self.was_moving.add(track_id)
+            if m.heading is not None:
+                self.last_heading[track_id] = m.heading
 
             self.signals[track_id] = {
                 "flow_dev": flow_dev,
                 "swings": swings,
                 "headway": headway,
+                "decel": decel,
             }
 
             checks = {
@@ -157,12 +175,8 @@ class HazardDetector:
                     m.turn_rate,
                 ),
                 HARD_BRAKING: (
-                    m.accel is not None
-                    and m.accel <= -cfg["brake_decel_threshold"]
-                    # Speed one velocity step ago must have been real driving speed
-                    and m.speed - m.accel * MOTION_CONFIG["velocity_step"] / self.fps
-                    >= cfg["brake_min_speed"],
-                    m.accel,
+                    decel is not None and decel >= cfg["brake_decel_threshold"],
+                    -(decel or 0.0),
                 ),
                 WRONG_WAY: (
                     flow_dev is not None and flow_dev >= cfg["wrong_way_angle"],
@@ -176,7 +190,7 @@ class HazardDetector:
                 STOPPED: (
                     track_id in self.was_moving
                     and m.speed <= cfg["stopped_speed"]
-                    and moving >= cfg["min_moving_cars"],
+                    and self._stopped_in_flow(track_id, m, metrics),
                     self.streaks[(track_id, STOPPED)] / self.fps,
                 ),
             }
@@ -212,6 +226,48 @@ class HazardDetector:
         if samples < self.cfg["flow_min_samples"] or consistency < self.cfg["flow_min_consistency"]:
             return None
         return _angle_diff(m.heading, direction)
+
+    def _decel(self, frame_idx, track_id, m):
+        """Average deceleration over brake_window_s, or None if it isn't hard braking.
+
+        Needs a speed from exactly brake_window_s ago that was real driving speed,
+        and the car must have lost a real share of it, so jitter can't trigger it.
+        """
+        cfg = self.cfg
+        history = self.speed_history.setdefault(track_id, deque(maxlen=self.brake_frames + 1))
+        history.append((frame_idx, m.speed))
+        old_frame, old_speed = history[0]
+        if frame_idx - old_frame != self.brake_frames:
+            return None  # gap in the history (skipped or missing frames)
+        if old_speed < cfg["brake_min_speed"] or m.speed > old_speed * (1 - cfg["brake_min_drop"]):
+            return None
+        return (old_speed - m.speed) / (self.brake_frames / self.fps)
+
+    def _stopped_in_flow(self, track_id, m, metrics):
+        """True if cars going this car's way keep moving and it isn't just queued."""
+        cfg = self.cfg
+        heading = self.last_heading.get(track_id)
+        if heading is None:
+            return False
+        ux, uy = math.cos(math.radians(heading)), math.sin(math.radians(heading))
+
+        passing = 0
+        for other_id, o in metrics.items():
+            if other_id == track_id:
+                continue
+            if o.speed >= cfg["brake_min_speed"]:
+                if o.heading is not None and _angle_diff(o.heading, heading) <= cfg["stopped_flow_angle"]:
+                    passing += 1
+            elif o.speed <= cfg["stopped_speed"]:
+                # A stopped car right ahead in the same lane means a queue
+                dx, dy = o.cx - m.cx, o.cy - m.cy
+                along = dx * ux + dy * uy
+                lateral = abs(dx * uy - dy * ux)
+                size = (m.height + o.height) / 2
+                if (0 < along <= (1 + cfg["stopped_queue_gap"]) * size
+                        and lateral <= cfg["tailgate_max_lateral"] * size):
+                    return False
+        return passing >= cfg["stopped_min_passing"]
 
     def _swings(self, track_id, m):
         """How many times the car switched between turning left and right recently."""
